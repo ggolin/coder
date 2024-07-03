@@ -919,15 +919,20 @@ func (q *FakeQuerier) AcquireNotificationMessages(_ context.Context, arg databas
 		return nil, err
 	}
 
+	// Shift the first "Count" notifications off the slice (FIFO).
+	sz := len(q.notificationMessages)
+	if sz > int(arg.Count) {
+		sz = int(arg.Count)
+	}
+
+	list := q.notificationMessages[:sz]
+	q.notificationMessages = q.notificationMessages[sz:]
+
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
 	var out []database.AcquireNotificationMessagesRow
-	for _, nm := range q.notificationMessages {
-		if len(out) >= int(arg.Count) {
-			break
-		}
-
+	for _, nm := range list {
 		acquirableStatuses := []database.NotificationMessageStatus{database.NotificationMessageStatusPending, database.NotificationMessageStatusTemporaryFailure}
 		if !slices.Contains(acquirableStatuses, nm.Status) {
 			continue
@@ -943,9 +948,9 @@ func (q *FakeQuerier) AcquireNotificationMessages(_ context.Context, arg databas
 			ID:            nm.ID,
 			Payload:       nm.Payload,
 			Method:        nm.Method,
-			CreatedBy:     nm.CreatedBy,
 			TitleTemplate: "This is a title with {{.Labels.variable}}",
 			BodyTemplate:  "This is a body with {{.Labels.variable}}",
+			TemplateID:    nm.NotificationTemplateID,
 		})
 	}
 

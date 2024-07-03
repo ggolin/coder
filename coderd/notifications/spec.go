@@ -24,8 +24,6 @@ type Store interface {
 
 // Handler is responsible for preparing and delivering a notification by a given method.
 type Handler interface {
-	NotificationMethod() database.NotificationMethod
-
 	// Dispatcher constructs a DeliveryFunc to be used for delivering a notification via the chosen method.
 	Dispatcher(payload types.MessagePayload, title, body string) (dispatch.DeliveryFunc, error)
 }

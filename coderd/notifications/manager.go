@@ -41,6 +41,9 @@ type Manager struct {
 
 	notifier *notifier
 	handlers map[database.NotificationMethod]Handler
+	method   database.NotificationMethod
+
+	metrics *Metrics
 
 	runOnce  sync.Once
 	stopOnce sync.Once
@@ -52,11 +55,23 @@ type Manager struct {
 //
 // helpers is a map of template helpers which are used to customize notification messages to use global settings like
 // access URL etc.
-func NewManager(cfg codersdk.NotificationsConfig, store Store, log slog.Logger) (*Manager, error) {
+func NewManager(cfg codersdk.NotificationsConfig, store Store, metrics *Metrics, log slog.Logger) (*Manager, error) {
+	if metrics == nil {
+		panic("nil metrics passed to notifications manager")
+	}
+
+	method, err := dispatchMethodFromCfg(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Manager{
 		log:   log,
 		cfg:   cfg,
 		store: store,
+
+		metrics: metrics,
+		method:  method,
 
 		stop: make(chan any),
 		done: make(chan any),
@@ -126,9 +141,25 @@ func (m *Manager) loop(ctx context.Context) error {
 	var eg errgroup.Group
 
 	// Create a notifier to run concurrently, which will handle dequeueing and dispatching notifications.
-	m.notifier = newNotifier(m.cfg, uuid.New(), m.log, m.store, m.handlers)
+	m.notifier = newNotifier(m.cfg, uuid.New(), m.log, m.store, m.handlers, m.method, m.metrics)
 	eg.Go(func() error {
 		return m.notifier.run(ctx, success, failure)
+	})
+
+	// Periodically measure how many updates are pending.
+	eg.Go(func() error {
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-m.stop:
+				return nil
+			case <-tick.C:
+				m.metrics.PendingUpdates.Set(float64(len(success) + len(failure)))
+			}
+		}
 	})
 
 	// Periodically flush notification state changes to the store.
@@ -329,22 +360,4 @@ type dispatchResult struct {
 	ts        time.Time
 	err       error
 	retryable bool
-}
-
-func newSuccessfulDispatch(notifier, msg uuid.UUID) dispatchResult {
-	return dispatchResult{
-		notifier: notifier,
-		msg:      msg,
-		ts:       time.Now(),
-	}
-}
-
-func newFailedDispatch(notifier, msg uuid.UUID, err error, retryable bool) dispatchResult {
-	return dispatchResult{
-		notifier:  notifier,
-		msg:       msg,
-		ts:        time.Now(),
-		err:       err,
-		retryable: retryable,
-	}
 }

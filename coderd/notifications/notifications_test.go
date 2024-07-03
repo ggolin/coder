@@ -1,7 +1,6 @@
 package notifications_test
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -16,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
+	"golang.org/x/exp/slices"
 
 	"github.com/coder/serpent"
 
@@ -24,7 +24,6 @@ import (
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
 	"github.com/coder/coder/v2/coderd/notifications"
 	"github.com/coder/coder/v2/coderd/notifications/dispatch"
-	"github.com/coder/coder/v2/coderd/notifications/types"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/testutil"
 )
@@ -50,7 +49,7 @@ func TestBasicNotificationRoundtrip(t *testing.T) {
 	handler := &fakeHandler{}
 
 	cfg := defaultNotificationsConfig(method)
-	mgr, err := notifications.NewManager(cfg, db, logger.Named("manager"))
+	mgr, err := notifications.NewManager(cfg, db, createMetrics(), logger.Named("manager"))
 	require.NoError(t, err)
 	mgr.WithHandlers(map[database.NotificationMethod]notifications.Handler{method: handler})
 	t.Cleanup(func() {
@@ -71,8 +70,17 @@ func TestBasicNotificationRoundtrip(t *testing.T) {
 	mgr.Run(ctx)
 
 	// then
-	require.Eventually(t, func() bool { return handler.succeeded == sid.String() }, testutil.WaitLong, testutil.IntervalMedium)
-	require.Eventually(t, func() bool { return handler.failed == fid.String() }, testutil.WaitLong, testutil.IntervalMedium)
+	require.Eventually(t, func() bool {
+		handler.mu.RLock()
+		defer handler.mu.RUnlock()
+		return slices.Contains(handler.succeeded, sid.String())
+	}, testutil.WaitLong, testutil.IntervalMedium)
+
+	require.Eventually(t, func() bool {
+		handler.mu.RLock()
+		defer handler.mu.RUnlock()
+		return slices.Contains(handler.failed, fid.String())
+	}, testutil.WaitLong, testutil.IntervalMedium)
 }
 
 func TestSMTPDispatch(t *testing.T) {
@@ -104,7 +112,7 @@ func TestSMTPDispatch(t *testing.T) {
 		Hello:     "localhost",
 	}
 	handler := newDispatchInterceptor(dispatch.NewSMTPHandler(cfg.SMTP, logger.Named("smtp")))
-	mgr, err := notifications.NewManager(cfg, db, logger.Named("manager"))
+	mgr, err := notifications.NewManager(cfg, db, createMetrics(), logger.Named("manager"))
 	require.NoError(t, err)
 	mgr.WithHandlers(map[database.NotificationMethod]notifications.Handler{method: handler})
 	t.Cleanup(func() {
@@ -185,7 +193,7 @@ func TestWebhookDispatch(t *testing.T) {
 	cfg.Webhook = codersdk.NotificationsWebhookConfig{
 		Endpoint: *serpent.URLOf(endpoint),
 	}
-	mgr, err := notifications.NewManager(cfg, db, logger.Named("manager"))
+	mgr, err := notifications.NewManager(cfg, db, createMetrics(), logger.Named("manager"))
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		require.NoError(t, mgr.Stop(ctx))
@@ -269,7 +277,7 @@ func TestBackpressure(t *testing.T) {
 	storeInterceptor := &bulkUpdateInterceptor{Store: db}
 
 	// given
-	mgr, err := notifications.NewManager(cfg, storeInterceptor, logger.Named("manager"))
+	mgr, err := notifications.NewManager(cfg, storeInterceptor, createMetrics(), logger.Named("manager"))
 	require.NoError(t, err)
 	mgr.WithHandlers(map[database.NotificationMethod]notifications.Handler{method: handler})
 	enq, err := notifications.NewStoreEnqueuer(cfg, db, defaultHelpers(), logger.Named("enqueuer"))
@@ -371,7 +379,7 @@ func TestRetries(t *testing.T) {
 	storeInterceptor := &bulkUpdateInterceptor{Store: db}
 
 	// given
-	mgr, err := notifications.NewManager(cfg, storeInterceptor, logger.Named("manager"))
+	mgr, err := notifications.NewManager(cfg, storeInterceptor, createMetrics(), logger.Named("manager"))
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		require.NoError(t, mgr.Stop(ctx))
@@ -400,68 +408,4 @@ func TestRetries(t *testing.T) {
 		return storeInterceptor.failed.Load() == maxAttempts-1 &&
 			storeInterceptor.sent.Load() == 1
 	}, testutil.WaitLong, testutil.IntervalFast)
-}
-
-type fakeHandler struct {
-	succeeded string
-	failed    string
-}
-
-func (*fakeHandler) NotificationMethod() database.NotificationMethod {
-	return database.NotificationMethodSmtp
-}
-
-func (f *fakeHandler) Dispatcher(payload types.MessagePayload, _, _ string) (dispatch.DeliveryFunc, error) {
-	return func(ctx context.Context, msgID uuid.UUID) (retryable bool, err error) {
-		if payload.Labels["type"] == "success" {
-			f.succeeded = msgID.String()
-		} else {
-			f.failed = msgID.String()
-		}
-		return false, nil
-	}, nil
-}
-
-type dispatchInterceptor struct {
-	handler notifications.Handler
-
-	sent        atomic.Int32
-	retryable   atomic.Int32
-	unretryable atomic.Int32
-	err         atomic.Int32
-	lastErr     atomic.Value
-}
-
-func newDispatchInterceptor(h notifications.Handler) *dispatchInterceptor {
-	return &dispatchInterceptor{handler: h}
-}
-
-func (i *dispatchInterceptor) NotificationMethod() database.NotificationMethod {
-	return i.handler.NotificationMethod()
-}
-
-func (i *dispatchInterceptor) Dispatcher(payload types.MessagePayload, title, body string) (dispatch.DeliveryFunc, error) {
-	return func(ctx context.Context, msgID uuid.UUID) (retryable bool, err error) {
-		deliveryFn, err := i.handler.Dispatcher(payload, title, body)
-		if err != nil {
-			return false, err
-		}
-
-		retryable, err = deliveryFn(ctx, msgID)
-
-		if err != nil {
-			i.err.Add(1)
-			i.lastErr.Store(err)
-		}
-
-		switch {
-		case !retryable && err == nil:
-			i.sent.Add(1)
-		case retryable:
-			i.retryable.Add(1)
-		case !retryable && err != nil:
-			i.unretryable.Add(1)
-		}
-		return retryable, err
-	}, nil
 }

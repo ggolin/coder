@@ -37,7 +37,7 @@ func TestBufferedUpdates(t *testing.T) {
 
 	santa := &santaHandler{}
 	cfg := defaultNotificationsConfig(database.NotificationMethodSmtp)
-	mgr, err := notifications.NewManager(cfg, interceptor, logger.Named("notifications-manager"))
+	mgr, err := notifications.NewManager(cfg, interceptor, createMetrics(), logger.Named("notifications-manager"))
 	require.NoError(t, err)
 	mgr.WithHandlers(map[database.NotificationMethod]notifications.Handler{
 		database.NotificationMethodSmtp: santa,
@@ -142,7 +142,7 @@ func TestStopBeforeRun(t *testing.T) {
 
 	ctx := context.Background()
 	logger := slogtest.Make(t, &slogtest.Options{IgnoreErrors: true, IgnoredErrorIs: []error{}}).Leveled(slog.LevelDebug)
-	mgr, err := notifications.NewManager(defaultNotificationsConfig(database.NotificationMethodSmtp), dbmem.New(), logger.Named("notifications-manager"))
+	mgr, err := notifications.NewManager(defaultNotificationsConfig(database.NotificationMethodSmtp), dbmem.New(), createMetrics(), logger.Named("notifications-manager"))
 	require.NoError(t, err)
 
 	// Call stop before notifier is started with Run().
@@ -182,10 +182,6 @@ func (b *bulkUpdateInterceptor) BulkMarkNotificationMessagesFailed(ctx context.C
 type santaHandler struct {
 	naughty atomic.Int32
 	nice    atomic.Int32
-}
-
-func (*santaHandler) NotificationMethod() database.NotificationMethod {
-	return database.NotificationMethodSmtp
 }
 
 func (s *santaHandler) Dispatcher(payload types.MessagePayload, _, _ string) (dispatch.DeliveryFunc, error) {
